@@ -1,8 +1,8 @@
-;; StacksMint Treasury Contract v2.1
+ ;; StacksMint Treasury Contract v2.2
 ;; Handles creator fee collection, royalty distribution, and platform revenue
-;; Version: 2.1.0
+;; Version: 2.2.0
 ;; Author: StacksMint Team
-;; Upgrade: v2.1 - Multi-sig, batch withdrawals, fee tiers, analytics
+;; Upgrades: batch withdrawals, multi-sig execution, analytics
 
 ;; ============================================================================
 ;; Configuration Constants
@@ -31,6 +31,7 @@
 (define-constant ERR_NOT_SIGNER (err u208))
 (define-constant ERR_INSUFFICIENT_SIGNATURES (err u209))
 (define-constant ERR_COOLDOWN_ACTIVE (err u210))
+(define-constant ERR_BATCH_TOO_LARGE (err u211))
 
 ;; ============================================================================
 ;; Data Variables
@@ -42,37 +43,23 @@
 (define-data-var fee-paused bool false)
 (define-data-var required-signatures uint u2)
 (define-data-var withdrawal-cooldown uint u144) ;; ~1 day in blocks
+(define-data-var batch-limit uint u20) ;; max batch withdrawals
 
 ;; ============================================================================
 ;; Data Maps
 ;; ============================================================================
 
-;; Track royalty earnings per creator
 (define-map creator-royalties principal uint)
-
-;; Track pending withdrawals
 (define-map pending-withdrawals principal uint)
-
-;; Multi-sig signers
 (define-map authorized-signers principal bool)
-
-;; Withdrawal signatures
 (define-map withdrawal-signatures { recipient: principal, amount: uint } (list 5 principal))
-
-;; User tier based on volume
 (define-map user-tiers principal (string-ascii 10))
-
-;; Last withdrawal timestamp (for cooldown)
 (define-map last-withdrawal principal uint)
-
-;; Daily fee analytics
 (define-map daily-fees uint uint)
-
-;; Creator lifetime earnings
 (define-map creator-lifetime-earnings principal uint)
 
 ;; ============================================================================
-;; Authorization Checks
+;; Private Helper Functions
 ;; ============================================================================
 
 (define-private (is-contract-owner)
@@ -85,21 +72,16 @@
 ;; Fee Tier System
 ;; ============================================================================
 
-;; Get fee discount based on user tier
 (define-read-only (get-fee-discount (user principal))
   (let ((tier (default-to "standard" (map-get? user-tiers user))))
-    (if (is-eq tier "whale")
-      u50  ;; 50% discount for whales
-      (if (is-eq tier "vip")
-        u25  ;; 25% discount for VIP
-        u0))))  ;; No discount for standard
+    (if (is-eq tier "whale") u50
+      (if (is-eq tier "vip") u25
+        u0))))
 
-;; Calculate discounted fee
 (define-private (calculate-discounted-fee (base-fee uint) (user principal))
   (let ((discount (get-fee-discount user)))
     (- base-fee (/ (* base-fee discount) u100))))
 
-;; Update user tier based on volume
 (define-private (update-user-tier (user principal) (volume uint))
   (let ((current-earnings (default-to u0 (map-get? creator-lifetime-earnings user)))
         (new-total (+ current-earnings volume)))
@@ -119,13 +101,11 @@
 (define-public (collect-fee)
   (begin
     (asserts! (not (var-get fee-paused)) ERR_UNAUTHORIZED)
-    (let ((base-fee CREATOR_FEE)
-          (discounted-fee (calculate-discounted-fee CREATOR_FEE tx-sender))
+    (let ((discounted-fee (calculate-discounted-fee CREATOR_FEE tx-sender))
           (day-block (/ block-height u144)))
       (try! (stx-transfer? discounted-fee tx-sender CONTRACT_OWNER))
       (var-set total-fees-collected (+ (var-get total-fees-collected) discounted-fee))
       (var-set treasury-balance (+ (var-get treasury-balance) discounted-fee))
-      ;; Track daily analytics
       (map-set daily-fees day-block (+ (default-to u0 (map-get? daily-fees day-block)) discounted-fee))
       (ok discounted-fee))))
 
@@ -134,28 +114,24 @@
   (begin
     (asserts! (> sale-price u0) ERR_ZERO_AMOUNT)
     (asserts! (<= royalty-percent MAX_ROYALTY_PERCENT) ERR_INVALID_ROYALTY)
-    (let (
-      (discount (get-fee-discount tx-sender))
-      (base-marketplace-fee (/ (* sale-price MARKETPLACE_FEE_PERCENT) u1000))
-      (marketplace-fee (- base-marketplace-fee (/ (* base-marketplace-fee discount) u100)))
-      (royalty-amount (/ (* sale-price royalty-percent) u1000))
-      (day-block (/ block-height u144))
-    )
-      ;; Collect marketplace fee
-      (try! (stx-transfer? marketplace-fee tx-sender CONTRACT_OWNER))
-      (var-set total-fees-collected (+ (var-get total-fees-collected) marketplace-fee))
-      (map-set daily-fees day-block (+ (default-to u0 (map-get? daily-fees day-block)) marketplace-fee))
-      
-      ;; Distribute royalty to creator if applicable
-      (if (> royalty-amount u0)
-        (begin
-          (try! (stx-transfer? royalty-amount tx-sender creator))
-          (map-set creator-royalties creator 
-            (+ (default-to u0 (map-get? creator-royalties creator)) royalty-amount))
-          (var-set total-royalties-distributed (+ (var-get total-royalties-distributed) royalty-amount))
-          (update-user-tier creator royalty-amount)
-          (ok { marketplace-fee: marketplace-fee, royalty: royalty-amount, discount: discount }))
-        (ok { marketplace-fee: marketplace-fee, royalty: u0, discount: discount })))))
+    (let ((discount (get-fee-discount tx-sender))
+          (base-marketplace-fee (/ (* sale-price MARKETPLACE_FEE_PERCENT) u1000))
+          (royalty-amount (/ (* sale-price royalty-percent) u1000))
+          (day-block (/ block-height u144)))
+      (let ((marketplace-fee (- base-marketplace-fee (/ (* base-marketplace-fee discount) u100))))
+        (try! (stx-transfer? marketplace-fee tx-sender CONTRACT_OWNER))
+        (var-set total-fees-collected (+ (var-get total-fees-collected) marketplace-fee))
+        (map-set daily-fees day-block (+ (default-to u0 (map-get? daily-fees day-block)) marketplace-fee))
+        ;; Distribute royalty
+        (if (> royalty-amount u0)
+          (begin
+            (try! (stx-transfer? royalty-amount tx-sender creator))
+            (map-set creator-royalties creator 
+              (+ (default-to u0 (map-get? creator-royalties creator)) royalty-amount))
+            (var-set total-royalties-distributed (+ (var-get total-royalties-distributed) royalty-amount))
+            (update-user-tier creator royalty-amount)
+            (ok { marketplace-fee: marketplace-fee, royalty: royalty-amount, discount: discount }))
+          (ok { marketplace-fee: marketplace-fee, royalty: u0, discount: discount }))))))
 
 ;; Withdraw accumulated royalties with cooldown
 (define-public (withdraw-royalties)
@@ -166,6 +142,22 @@
     (map-set creator-royalties tx-sender u0)
     (map-set last-withdrawal tx-sender block-height)
     (ok amount)))
+
+;; Batch withdrawal for multiple creators
+(define-public (withdraw-royalties-batch (recipients (list 20 principal)))
+  (asserts! (<= (len recipients) (var-get batch-limit)) ERR_BATCH_TOO_LARGE)
+  (let ((total-withdrawn u0))
+    (begin
+      (for recipient recipients
+        (let ((amount (default-to u0 (map-get? creator-royalties recipient))))
+          (if (> amount u0)
+            (begin
+              (map-set creator-royalties recipient u0)
+              (map-set last-withdrawal recipient block-height)
+              (var-set total-royalties-distributed (+ (var-get total-royalties-distributed) amount))
+              (var-set total-withdrawn (+ total-withdrawn amount))
+              (try! (stx-transfer? amount CONTRACT_OWNER recipient))))))
+      (ok total-withdrawn))))
 
 ;; ============================================================================
 ;; Multi-Sig Functions
@@ -197,11 +189,19 @@
         (unwrap! (as-max-len? (append current-sigs tx-sender) u5) ERR_UNAUTHORIZED))
       (ok true))))
 
+;; Execute multi-sig withdrawal
+(define-public (execute-withdrawal (recipient principal) (amount uint))
+  (let ((sigs (default-to (list) (map-get? withdrawal-signatures { recipient: recipient, amount: amount }))))
+    (asserts! (>= (len sigs) (var-get required-signatures)) ERR_INSUFFICIENT_SIGNATURES)
+    (map-delete withdrawal-signatures { recipient: recipient, amount: amount })
+    (try! (stx-transfer? amount CONTRACT_OWNER recipient))
+    (ok amount)))
+
 ;; ============================================================================
 ;; Admin Functions
 ;; ============================================================================
 
-;; Pause fee collection (emergency)
+;; Pause fee collection
 (define-public (set-fee-paused (paused bool))
   (begin
     (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
@@ -222,34 +222,25 @@
     (var-set withdrawal-cooldown blocks)
     (ok blocks)))
 
+;; Update batch limit
+(define-public (set-batch-limit (limit uint))
+  (begin
+    (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+    (var-set batch-limit limit)
+    (ok limit)))
+
 ;; ============================================================================
 ;; Read-Only Functions
 ;; ============================================================================
 
-(define-read-only (get-total-fees)
-  (var-get total-fees-collected))
-
-(define-read-only (get-total-royalties)
-  (var-get total-royalties-distributed))
-
-(define-read-only (get-treasury-balance)
-  (var-get treasury-balance))
-
-(define-read-only (get-creator-royalties (creator principal))
-  (default-to u0 (map-get? creator-royalties creator)))
-
-(define-read-only (get-user-tier (user principal))
-  (default-to "standard" (map-get? user-tiers user)))
-
-(define-read-only (get-creator-lifetime-earnings (creator principal))
-  (default-to u0 (map-get? creator-lifetime-earnings creator)))
-
-(define-read-only (get-daily-fees (day-block uint))
-  (default-to u0 (map-get? daily-fees day-block)))
-
-(define-read-only (is-fee-paused)
-  (var-get fee-paused))
-
+(define-read-only (get-total-fees) (var-get total-fees-collected))
+(define-read-only (get-total-royalties) (var-get total-royalties-distributed))
+(define-read-only (get-treasury-balance) (var-get treasury-balance))
+(define-read-only (get-creator-royalties (creator principal)) (default-to u0 (map-get? creator-royalties creator)))
+(define-read-only (get-user-tier (user principal)) (default-to "standard" (map-get? user-tiers user)))
+(define-read-only (get-creator-lifetime-earnings (creator principal)) (default-to u0 (map-get? creator-lifetime-earnings creator)))
+(define-read-only (get-daily-fees (day-block uint)) (default-to u0 (map-get? daily-fees day-block)))
+(define-read-only (is-fee-paused) (var-get fee-paused))
 (define-read-only (get-config)
   {
     creator-fee: CREATOR_FEE,
@@ -257,5 +248,6 @@
     max-royalty-percent: MAX_ROYALTY_PERCENT,
     min-withdrawal: MIN_WITHDRAWAL,
     required-signatures: (var-get required-signatures),
-    withdrawal-cooldown: (var-get withdrawal-cooldown)
+    withdrawal-cooldown: (var-get withdrawal-cooldown),
+    batch-limit: (var-get batch-limit)
   })
